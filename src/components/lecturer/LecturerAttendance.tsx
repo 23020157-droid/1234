@@ -51,6 +51,7 @@ interface LecturerAttendanceProps {
     checkInCode: string;
     allowLateMinutes: number;
     startImmediately?: boolean;
+    attendanceMethod?: 'MANUAL' | 'QR';
   }) => void | Promise<void>;
   onStartSession?: (sessionId: string) => void | Promise<void>;
   onCloseSession?: (sessionId: string) => void | Promise<void>;
@@ -82,6 +83,16 @@ export const LecturerAttendance: React.FC<LecturerAttendanceProps> = ({
   error = null,
 }) => {
   const sessions = initialSessionsProp || [];
+  const today = new Date();
+  const localDate = `${today.getFullYear()}-${String(today.getMonth() + 1).padStart(2, '0')}-${String(today.getDate()).padStart(2, '0')}`;
+  const getNextCheckInTimes = () => {
+    const now = new Date();
+    now.setMinutes(Math.ceil((now.getMinutes() + 1) / 5) * 5, 0, 0);
+    const end = new Date(now.getTime() + 30 * 60 * 1000);
+    const toTime = (value: Date) =>
+      `${String(value.getHours()).padStart(2, '0')}:${String(value.getMinutes()).padStart(2, '0')}`;
+    return { date: localDate, startTime: toTime(now), endTime: toTime(end) };
+  };
   const [searchTerm, setSearchTerm] = useState('');
   const [statusFilter, setStatusFilter] = useState<'all' | AttendanceStatus>('all');
   const [courseFilter, setCourseFilter] = useState<string>('all');
@@ -205,6 +216,7 @@ export const LecturerAttendance: React.FC<LecturerAttendanceProps> = ({
 
   // Modals
   const [isCreateModalOpen, setIsCreateModalOpen] = useState(false);
+  const [createSessionError, setCreateSessionError] = useState('');
   const [isCloseConfirmOpen, setIsCloseConfirmOpen] = useState(false);
 
   const getCourseLabel = (course: Course) => `${course.code || course.class_code || course.title || course.class_name || 'Course'}`;
@@ -214,13 +226,14 @@ export const LecturerAttendance: React.FC<LecturerAttendanceProps> = ({
     courseCode: lecturerCourses[0]?.code || lecturerCourses[0]?.class_code || '',
     courseTitle: lecturerCourses[0]?.title || lecturerCourses[0]?.class_name || 'Lecture Course',
     sessionTitle: 'Lecture Session',
-    date: new Date().toISOString().slice(0, 10),
+    date: localDate,
     startTime: '09:00',
     endTime: '10:30',
     room: lecturerCourses[0]?.room || 'Classroom',
     checkInCode: '',
     allowLateMinutes: 15,
     startImmediately: true,
+    attendanceMethod: 'MANUAL' as 'MANUAL' | 'QR',
   });
 
   useEffect(() => {
@@ -295,6 +308,7 @@ export const LecturerAttendance: React.FC<LecturerAttendanceProps> = ({
   }, [formData.courseCode, lecturerCourses, schedule]);
 
   useEffect(() => {
+    if (formData.attendanceMethod === 'QR') return;
     const matchingSchedule = scheduleOptions.find((item) => item.date === formData.date) || scheduleOptions[0];
     if (!matchingSchedule) return;
     setFormData((previous) => {
@@ -315,10 +329,10 @@ export const LecturerAttendance: React.FC<LecturerAttendanceProps> = ({
         sessionTitle: matchingSchedule.sessionTopic,
       };
     });
-  }, [scheduleOptions, formData.date]);
+  }, [scheduleOptions, formData.date, formData.attendanceMethod]);
 
   // Active Selected Session
-  const activeSession = useMemo(() => {
+  const activeSession = useMemo<AttendanceSession | null>(() => {
     const existingSession = selectedSchedule
       ? sessionOptions.find(
           (session) =>
@@ -358,7 +372,7 @@ export const LecturerAttendance: React.FC<LecturerAttendanceProps> = ({
   }, [lecturerCourses, selectedSchedule, selectedSessionId, sessionOptions]);
 
   // Records for the selected session
-  const sessionRecords = useMemo(() => {
+  const sessionRecords = useMemo<AttendanceRecord[]>(() => {
     if (!activeSession) return [];
     const course = lecturerCourses.find(
       (item) =>
@@ -531,8 +545,20 @@ export const LecturerAttendance: React.FC<LecturerAttendanceProps> = ({
 
   const handleCreateSessionSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
+    setCreateSessionError('');
     if (onCreateSession) {
       try {
+        if (!formData.sessionTitle.trim()) {
+          throw new Error('Vui lòng nhập tên phiên điểm danh.');
+        }
+        const startAt = new Date(`${formData.date}T${formData.startTime}:00`);
+        const endAt = new Date(`${formData.date}T${formData.endTime}:00`);
+        if (!Number.isFinite(startAt.getTime()) || !Number.isFinite(endAt.getTime()) || endAt <= startAt) {
+          throw new Error('Thời gian kết thúc phải sau thời gian bắt đầu.');
+        }
+        if (formData.attendanceMethod === 'QR' && endAt.getTime() < Date.now()) {
+          throw new Error('Thời gian kết thúc đã qua. Hãy chọn một khoảng thời gian hiện tại hoặc sắp tới.');
+        }
         const course = lecturerCourses.find(
           (c) => (c.code || c.class_code) === formData.courseCode || String(c.id) === formData.courseCode
         );
@@ -545,17 +571,18 @@ export const LecturerAttendance: React.FC<LecturerAttendanceProps> = ({
           courseId: String(course.id),
           courseCode: course.code || course.class_code || formData.courseCode,
           courseTitle: course.title || course.class_name || formData.courseTitle,
+          attendanceMethod: formData.attendanceMethod,
         });
         setIsCreateModalOpen(false);
-      } catch (err) {
-        return;
+      } catch (err: unknown) {
+        setCreateSessionError(err instanceof Error ? err.message : String(err));
       }
     }
   };
 
   const handleExportCSV = () => {
     if (!activeSession) return;
-    const headers = ['Mã sinh viên', 'Student Name', 'Email', 'Trạng thái', 'Thời gian điểm danh', 'Phương thức', 'Notes'];
+    const headers = ['Mã sinh viên', 'Student Name', 'Email', 'Trạng thái', 'Thời gian điểm danh', 'Phương thức', 'Cảnh báo', 'Notes'];
     const rows = activeSession.records.map((r) => [
       r.studentId,
       `"${r.studentName}"`,
@@ -563,6 +590,7 @@ export const LecturerAttendance: React.FC<LecturerAttendanceProps> = ({
       r.status.toUpperCase(),
       r.checkInTime || 'N/A',
       r.method || 'N/A',
+      r.warning || '',
       `"${r.notes || ''}"`,
     ]);
     const csvContent = 'data:text/csv;charset=utf-8,' + [headers.join(','), ...rows.map((e) => e.join(','))].join('\n');
@@ -605,6 +633,7 @@ export const LecturerAttendance: React.FC<LecturerAttendanceProps> = ({
           <button
             id="btn-create-session"
             onClick={() => {
+              setCreateSessionError('');
               setIsCreateModalOpen(true);
             }}
             className="flex items-center gap-2 px-4 py-2.5 bg-gradient-to-r from-indigo-600 to-indigo-500 hover:from-indigo-500 hover:to-indigo-600 text-white text-xs font-bold rounded-xl shadow-[0_8px_20px_rgba(79,70,229,0.28)] transition-all duration-200"
@@ -678,7 +707,7 @@ export const LecturerAttendance: React.FC<LecturerAttendanceProps> = ({
         </div>
 
         <div className="mt-4 flex items-center gap-3 flex-wrap">
-          {activeSession && activeSession.status === 'scheduled' && (
+          {activeSession && activeSession.status === 'scheduled' && activeSession.attendanceMethod !== 'QR' && (
             <button
               id="btn-start-attendance"
               onClick={() => handleStartAttendance(activeSession.id)}
@@ -700,13 +729,26 @@ export const LecturerAttendance: React.FC<LecturerAttendanceProps> = ({
               >
                 <span className="flex items-center gap-2">
                   <StopCircle className="w-3.5 h-3.5" />
-                  Khóa phiên điểm danh
+                  {activeSession.attendanceMethod === 'QR' ? 'KHÓA PHIÊN' : 'Khóa phiên điểm danh'}
                 </span>
               </button>
             </>
           )}
 
-          {activeSession && activeSession.status === 'closed' && (
+          {activeSession?.attendanceMethod === 'QR' && (
+            <div className="rounded-xl border border-indigo-300/40 bg-indigo-950/60 px-4 py-2 text-xs text-indigo-100">
+              <span className="font-semibold">Mã phiên: </span>
+              <span className="font-mono font-black tracking-widest">{activeSession.sessionCode || '—'}</span>
+              <span className="ml-3">
+                {activeSession.sessionStatus === 'LOCKED' ? 'Đã khóa' : activeSession.sessionStatus === 'UPCOMING' ? 'Sắp diễn ra' : 'Đang mở'}
+              </span>
+              <span className="ml-3 font-semibold">
+                Đã điểm danh: {stats.present + stats.late}/{stats.total}
+              </span>
+            </div>
+          )}
+
+          {activeSession && activeSession.status === 'closed' && activeSession.attendanceMethod !== 'QR' && (
             <button
               id="btn-reopen-attendance"
               onClick={() => handleStartAttendance(activeSession.id)}
@@ -843,6 +885,7 @@ export const LecturerAttendance: React.FC<LecturerAttendanceProps> = ({
                 <th className="px-5 py-3.5">Mã sinh viên</th>
                 <th className="px-5 py-3.5">Thời gian điểm danh</th>
                 <th className="px-5 py-3.5">Phương thức</th>
+                <th className="px-5 py-3.5">Cảnh báo</th>
                 <th className="px-5 py-3.5 text-center">Trạng thái</th>
                 <th className="px-5 py-3.5 text-right">Đổi trạng thái</th>
               </tr>
@@ -850,7 +893,7 @@ export const LecturerAttendance: React.FC<LecturerAttendanceProps> = ({
             <tbody className="divide-y divide-slate-100">
               {filteredRecords.length === 0 ? (
                 <tr>
-                  <td colSpan={6} className="px-5 py-8 text-center text-slate-400 text-xs">
+                  <td colSpan={7} className="px-5 py-8 text-center text-slate-400 text-xs">
                     No students found matching your search or filter.
                   </td>
                 </tr>
@@ -903,6 +946,19 @@ export const LecturerAttendance: React.FC<LecturerAttendanceProps> = ({
                         ) : (
                           <span className="text-slate-400">—</span>
                         )}
+                      </td>
+
+                      <td className="px-5 py-3.5">
+                        {record.warning ? (
+                          <span className="inline-flex items-center gap-1 text-amber-700 font-semibold" title="IP is only a warning signal and does not prove the student's physical location.">
+                            <AlertCircle className="w-3.5 h-3.5" />
+                            {record.warning.includes('khác')
+                              ? '⚠ IP khác với giảng viên'
+                              : record.warning}
+                          </span>
+                        ) : record.method === 'qr' ? (
+                          <span className="text-slate-400">Bình thường</span>
+                        ) : <span className="text-slate-400">—</span>}
                       </td>
 
                       <td className="px-5 py-3.5 text-center">
@@ -978,10 +1034,41 @@ export const LecturerAttendance: React.FC<LecturerAttendanceProps> = ({
           isOpen={isCreateModalOpen}
           onClose={() => setIsCreateModalOpen(false)}
           title="Tạo phiên điểm danh theo ca"
-          subtitle="Tạo buổi điểm danh để giảng viên cập nhật thủ công."
+          subtitle="Tạo phiên điểm danh thủ công hoặc QR một chạm cho lớp của bạn."
           maxWidth="lg"
         >
           <form onSubmit={handleCreateSessionSubmit} className="space-y-4 pt-2">
+            <div className="grid grid-cols-2 gap-2 rounded-xl bg-slate-100 p-1">
+              {([
+                ['MANUAL', 'Điểm danh thủ công'],
+                ['QR', 'QR một chạm'],
+              ] as const).map(([method, label]) => (
+                <button
+                  key={method}
+                  type="button"
+                  onClick={() => {
+                    setCreateSessionError('');
+                    setFormData((previous) => ({
+                      ...previous,
+                      ...(method === 'QR' ? getNextCheckInTimes() : {}),
+                      attendanceMethod: method,
+                    }));
+                  }}
+                  className={`rounded-lg px-3 py-2 text-xs font-bold transition-colors ${
+                    formData.attendanceMethod === method
+                      ? 'bg-white text-indigo-700 shadow-sm'
+                      : 'text-slate-600 hover:text-slate-900'
+                  }`}
+                >
+                  {label}
+                </button>
+              ))}
+            </div>
+            {createSessionError && (
+              <div role="alert" className="rounded-xl border border-rose-200 bg-rose-50 px-3 py-2.5 text-xs font-semibold text-rose-700">
+                {createSessionError}
+              </div>
+            )}
             <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
               <div>
                 <label className="block text-xs font-bold text-slate-700 mb-1">
@@ -1017,6 +1104,19 @@ export const LecturerAttendance: React.FC<LecturerAttendanceProps> = ({
               </div>
 
               <div>
+                <label className="block text-xs font-bold text-slate-700 mb-1">Tên phiên điểm danh *</label>
+                <input
+                  type="text"
+                  value={formData.sessionTitle}
+                  onChange={(e) => setFormData({ ...formData, sessionTitle: e.target.value })}
+                  maxLength={120}
+                  required
+                  className="w-full px-3 py-2 text-xs border border-slate-300 rounded-xl focus:ring-2 focus:ring-indigo-500"
+                  placeholder="Ví dụ: Buổi 1"
+                />
+              </div>
+
+              <div>
                 <label className="block text-xs font-bold text-slate-700 mb-1">
                   Session Date *
                 </label>
@@ -1034,7 +1134,11 @@ export const LecturerAttendance: React.FC<LecturerAttendanceProps> = ({
               <label className="block text-xs font-bold text-slate-700 mb-1">
                 Ca học theo lịch *
               </label>
-              {scheduleOptions.length > 0 ? (
+              {formData.attendanceMethod === 'QR' ? (
+                <div className="rounded-xl border border-indigo-200 bg-indigo-50 px-3 py-2 text-xs text-indigo-800">
+                  Nhập thời gian bắt đầu và kết thúc bên dưới. Phiên QR không bắt buộc gắn với một ca học trong lịch.
+                </div>
+              ) : scheduleOptions.length > 0 ? (
                 <select
                   value={`${formData.date}|${formData.startTime}|${formData.endTime}`}
                   onChange={(event) => {
@@ -1076,7 +1180,7 @@ export const LecturerAttendance: React.FC<LecturerAttendanceProps> = ({
                   type="time"
                   value={formData.startTime}
                   onChange={(e) => setFormData({ ...formData, startTime: e.target.value })}
-                  readOnly={scheduleOptions.length > 0}
+                  readOnly={scheduleOptions.length > 0 && formData.attendanceMethod === 'MANUAL'}
                   className="w-full px-3 py-2 text-xs border border-slate-300 rounded-xl focus:ring-2 focus:ring-indigo-500"
                   required
                 />
@@ -1090,7 +1194,7 @@ export const LecturerAttendance: React.FC<LecturerAttendanceProps> = ({
                   type="time"
                   value={formData.endTime}
                   onChange={(e) => setFormData({ ...formData, endTime: e.target.value })}
-                  readOnly={scheduleOptions.length > 0}
+                  readOnly={scheduleOptions.length > 0 && formData.attendanceMethod === 'MANUAL'}
                   className="w-full px-3 py-2 text-xs border border-slate-300 rounded-xl focus:ring-2 focus:ring-indigo-500"
                   required
                 />
@@ -1104,33 +1208,35 @@ export const LecturerAttendance: React.FC<LecturerAttendanceProps> = ({
                   type="text"
                   value={formData.room}
                   onChange={(e) => setFormData({ ...formData, room: e.target.value })}
-                  readOnly={scheduleOptions.length > 0}
+                  readOnly={scheduleOptions.length > 0 && formData.attendanceMethod === 'MANUAL'}
                   className="w-full px-3 py-2 text-xs border border-slate-300 rounded-xl focus:ring-2 focus:ring-indigo-500"
                   required
                 />
               </div>
             </div>
 
-            <div className="grid grid-cols-1 gap-4 pt-1">
-              <div>
-                <label className="block text-xs font-bold text-slate-700 mb-1">
-                  Late Arrival Grace Period (Minutes)
-                </label>
-                <input
-                  type="number"
-                  min={1}
-                  max={60}
-                  value={formData.allowLateMinutes}
-                  onChange={(e) => setFormData({ ...formData, allowLateMinutes: Number(e.target.value) })}
-                  className="w-full px-3 py-2 text-xs border border-slate-300 rounded-xl focus:ring-2 focus:ring-indigo-500"
-                />
-                <span className="text-[10px] text-slate-400 mt-0.5 block">
-                  Dùng để tham khảo khi giảng viên đánh dấu trạng thái <strong>Đi muộn</strong>.
-                </span>
+            {formData.attendanceMethod === 'MANUAL' && (
+              <div className="grid grid-cols-1 gap-4 pt-1">
+                <div>
+                  <label className="block text-xs font-bold text-slate-700 mb-1">
+                    Late Arrival Grace Period (Minutes)
+                  </label>
+                  <input
+                    type="number"
+                    min={1}
+                    max={60}
+                    value={formData.allowLateMinutes}
+                    onChange={(e) => setFormData({ ...formData, allowLateMinutes: Number(e.target.value) })}
+                    className="w-full px-3 py-2 text-xs border border-slate-300 rounded-xl focus:ring-2 focus:ring-indigo-500"
+                  />
+                  <span className="text-[10px] text-slate-400 mt-0.5 block">
+                    Dùng để tham khảo khi giảng viên đánh dấu trạng thái <strong>Đi muộn</strong>.
+                  </span>
+                </div>
               </div>
-            </div>
+            )}
 
-            <div className="pt-2">
+            {formData.attendanceMethod === 'MANUAL' && <div className="pt-2">
               <label className="flex items-center gap-2 text-xs text-slate-700 cursor-pointer">
                 <input
                   type="checkbox"
@@ -1142,7 +1248,7 @@ export const LecturerAttendance: React.FC<LecturerAttendanceProps> = ({
                   Bắt đầu điểm danh ngay sau khi tạo
                 </span>
               </label>
-            </div>
+            </div>}
 
             <div className="pt-4 border-t border-slate-100 flex justify-end gap-2.5">
               <button
@@ -1156,7 +1262,9 @@ export const LecturerAttendance: React.FC<LecturerAttendanceProps> = ({
                 type="submit"
                 className="px-5 py-2.5 bg-indigo-600 hover:bg-indigo-700 text-white text-xs font-bold rounded-xl shadow-xs transition-colors"
               >
-                {formData.startImmediately ? 'Tạo & bắt đầu điểm danh' : 'Lưu phiên theo lịch'}
+                {formData.attendanceMethod === 'QR'
+                  ? 'Tạo phiên QR'
+                  : formData.startImmediately ? 'Tạo & bắt đầu điểm danh' : 'Lưu phiên theo lịch'}
               </button>
             </div>
           </form>

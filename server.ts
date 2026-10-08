@@ -109,6 +109,12 @@ interface AttendanceSessionItem {
   active: boolean;
   is_active: boolean;
   qr_token: string;
+  session_code?: string;
+  attendance_method?: 'MANUAL' | 'QR';
+  status?: 'UPCOMING' | 'ACTIVE' | 'LOCKED';
+  lecturer_id?: number;
+  lecturer_ip?: string;
+  locked_at?: string;
   radius_meters: number;
   room?: string;
   allow_late_minutes: number;
@@ -128,6 +134,10 @@ interface AttendanceRecordItem {
   is_anomaly: boolean;
   anomaly_flag: boolean;
   anomaly_score: number;
+  attendance_method?: 'MANUAL' | 'QR';
+  attendance_time?: string;
+  student_ip?: string;
+  warning?: string | null;
 }
 
 let attendanceRecords: AttendanceRecordItem[] = [];
@@ -1046,26 +1056,109 @@ const syncStudentClassAttendanceGrade = (classId: number, studentId: number, stu
 };
 
 // ==================== Attendance ====================
+const isApprovedClassStudent = (classId: number, user: UserItem) =>
+  enrollments.some((enrollment) =>
+    enrollment.class_id === classId &&
+    enrollment.status === 'APPROVED' &&
+    (enrollment.student_id === user.id ||
+      Boolean(user.student_code && enrollment.student_code === user.student_code))
+  );
+
+const canManageClassAttendance = (classId: number, user: UserItem) =>
+  user.role === 'ADMIN' ||
+  (user.role === 'LECTURER' && classes.some((classItem) =>
+    classItem.id === classId && classItem.lecturer_id === user.id
+  ));
+
+const normalizeIpAddress = (address: string) =>
+  address.trim().replace(/^\[|\]$/g, '').replace(/^::ffff:/i, '').split('%')[0].toLowerCase();
+
+const getRequestIp = (req: Request) =>
+  normalizeIpAddress(String(req.ip || req.socket.remoteAddress || ''));
+
+const isLoopbackIp = (address: string) =>
+  address === '::1' || address === '::' || address.startsWith('127.');
+
+const getQrSessionStatus = (session: AttendanceSessionItem, now = Date.now()) => {
+  if (session.status === 'LOCKED') {
+    session.active = false;
+    session.is_active = false;
+    return 'LOCKED' as const;
+  }
+  const start = Date.parse(session.start_time);
+  const end = Date.parse(session.expires_at);
+  if (!Number.isFinite(start) || !Number.isFinite(end) || now > end) {
+    session.status = 'LOCKED';
+    session.active = false;
+    session.is_active = false;
+    session.locked_at ||= new Date(now).toISOString();
+    return 'LOCKED' as const;
+  }
+  if (now < start) {
+    session.status = 'UPCOMING';
+    session.active = false;
+    session.is_active = false;
+    return 'UPCOMING' as const;
+  }
+  session.status = 'ACTIVE';
+  session.active = true;
+  session.is_active = true;
+  return 'ACTIVE' as const;
+};
+
 app.get('/api/classes/:id/attendance/sessions', (req: Request, res: Response) => {
   const classId = Number(req.params.id);
-  const list = attendanceSessions.filter((s) => s.class_id === classId);
+  const user = getCurrentUser(req);
+  if (!Number.isSafeInteger(classId) || classId <= 0) {
+    return res.status(400).json({ detail: 'Invalid class id' });
+  }
+  if (!canManageClassAttendance(classId, user) && !(user.role === 'STUDENT' && isApprovedClassStudent(classId, user))) {
+    return res.status(403).json({ detail: 'You are not enrolled in this class.' });
+  }
+  const list = attendanceSessions
+    .filter((session) => session.class_id === classId)
+    .map((session) => {
+      const status = session.attendance_method === 'QR' ? getQrSessionStatus(session) : undefined;
+      if (user.role !== 'STUDENT') return status ? { ...session, status } : session;
+      const {
+        qr_token: _qrToken,
+        lecturer_ip: _lecturerIp,
+        session_code: _sessionCode,
+        ...studentSession
+      } = session;
+      return { ...studentSession, ...(status ? { status } : {}) };
+    });
   res.json(list);
 });
 
 app.post('/api/classes/:id/attendance/sessions', (req: Request, res: Response) => {
   const classId = Number(req.params.id);
+  const user = getCurrentUser(req);
+  if (!Number.isSafeInteger(classId) || classId <= 0) {
+    return res.status(400).json({ detail: 'Invalid class id' });
+  }
+  if (!canManageClassAttendance(classId, user)) {
+    return res.status(403).json({ detail: 'You are not authorized to create attendance sessions for this class.' });
+  }
   const body = req.body || {};
+  const startTime = String(body.start_time || new Date().toISOString());
+  const expiresAt = String(body.expires_at || new Date(Date.now() + 3600000).toISOString());
+  if (!Number.isFinite(Date.parse(startTime)) || !Number.isFinite(Date.parse(expiresAt)) || Date.parse(expiresAt) <= Date.parse(startTime)) {
+    return res.status(400).json({ detail: 'A valid attendance time range is required.' });
+  }
   const newSession: AttendanceSessionItem = {
-    id: attendanceSessions.length + 1,
+    id: attendanceSessions.reduce((maxId, item) => Math.max(maxId, item.id), 0) + 1,
     class_id: classId,
-    title: body.title || '',
-    start_time: body.start_time || new Date().toISOString(),
-    expires_at: body.expires_at || new Date(Date.now() + 3600000).toISOString(),
+    title: String(body.title || '').trim(),
+    start_time: startTime,
+    expires_at: expiresAt,
     active: true,
     is_active: true,
-    qr_token: body.qr_token || `PIN${Math.floor(1000 + Math.random() * 9000)}`,
+    qr_token: String(body.qr_token || `PIN${Math.floor(1000 + Math.random() * 9000)}`),
+    attendance_method: 'MANUAL',
+    lecturer_id: user.id,
     radius_meters: Number(body.radius_meters || 50),
-    room: body.room || '',
+    room: String(body.room || ''),
     allow_late_minutes: Number(body.allow_late_minutes || 15),
     created_at: new Date().toISOString(),
   };
@@ -1073,25 +1166,183 @@ app.post('/api/classes/:id/attendance/sessions', (req: Request, res: Response) =
   res.status(201).json(newSession);
 });
 
-app.get('/api/attendance/student/sessions', (_req: Request, res: Response) => {
-  res.json(attendanceSessions.filter((s) => s.is_active));
+app.post('/api/classes/:id/attendance/qr-sessions', (req: Request, res: Response) => {
+  const classId = Number(req.params.id);
+  const user = getCurrentUser(req);
+  if (!Number.isSafeInteger(classId) || classId <= 0) {
+    return res.status(400).json({ detail: 'Invalid class id' });
+  }
+  if (user.role !== 'LECTURER' || !canManageClassAttendance(classId, user)) {
+    return res.status(403).json({ detail: 'Only the class lecturer can create a QR attendance session.' });
+  }
+
+  const title = String(req.body?.title || '').trim();
+  const startTime = String(req.body?.start_time || '');
+  const expiresAt = String(req.body?.expires_at || '');
+  const start = Date.parse(startTime);
+  const end = Date.parse(expiresAt);
+  if (!title || title.length > 120 || !Number.isFinite(start) || !Number.isFinite(end) || end <= start) {
+    return res.status(400).json({ detail: 'Enter a session name and a valid start/end time range.' });
+  }
+
+  const now = Date.now();
+  let sessionCode = randomBytes(6).toString('hex').toUpperCase();
+  while (attendanceSessions.some((item) => item.session_code === sessionCode)) {
+    sessionCode = randomBytes(6).toString('hex').toUpperCase();
+  }
+  let qrToken = randomBytes(32).toString('hex');
+  while (attendanceSessions.some((item) => item.qr_token === qrToken)) {
+    qrToken = randomBytes(32).toString('hex');
+  }
+  const session: AttendanceSessionItem = {
+    id: attendanceSessions.reduce((maxId, item) => Math.max(maxId, item.id), 0) + 1,
+    class_id: classId,
+    title,
+    start_time: new Date(start).toISOString(),
+    expires_at: new Date(end).toISOString(),
+    active: start <= now && now <= end,
+    is_active: start <= now && now <= end,
+    qr_token: qrToken,
+    session_code: sessionCode,
+    attendance_method: 'QR',
+    status: start > now ? 'UPCOMING' : end < now ? 'LOCKED' : 'ACTIVE',
+    lecturer_id: user.id,
+    lecturer_ip: getRequestIp(req),
+    locked_at: end < now ? new Date(now).toISOString() : undefined,
+    radius_meters: 0,
+    room: String(req.body?.room || ''),
+    allow_late_minutes: 0,
+    created_at: new Date(now).toISOString(),
+  };
+  attendanceSessions.unshift(session);
+  res.status(201).json(session);
+});
+
+app.get('/api/attendance/student/sessions', (req: Request, res: Response) => {
+  const user = getCurrentUser(req);
+  if (user.role !== 'STUDENT') return res.status(403).json({ detail: 'Student access required.' });
+  const approvedClassIds = new Set(
+    enrollments
+      .filter((enrollment) =>
+        enrollment.status === 'APPROVED' &&
+        (enrollment.student_id === user.id ||
+          Boolean(user.student_code && enrollment.student_code === user.student_code))
+      )
+      .map((enrollment) => enrollment.class_id)
+  );
+  const sessions = attendanceSessions
+    .filter((session) => approvedClassIds.has(session.class_id))
+    .map((session) => {
+      const status = session.attendance_method === 'QR' ? getQrSessionStatus(session) : undefined;
+      const {
+        qr_token: _qrToken,
+        lecturer_ip: _lecturerIp,
+        session_code: _sessionCode,
+        ...studentSession
+      } = session;
+      return { ...studentSession, ...(status ? { status } : {}) };
+    });
+  res.json(sessions);
 });
 
 app.patch('/api/attendance/sessions/:id/close', (req: Request, res: Response) => {
   const id = Number(req.params.id);
   const session = attendanceSessions.find((s) => s.id === id);
-  if (session) {
-    session.active = false;
-    session.is_active = false;
+  if (!session) return res.status(404).json({ detail: 'Session not found' });
+  const user = getCurrentUser(req);
+  if (!canManageClassAttendance(session.class_id, user)) {
+    return res.status(403).json({ detail: 'You are not authorized to close this attendance session.' });
   }
-  res.json(session || {});
+  session.active = false;
+  session.is_active = false;
+  if (session.attendance_method === 'QR') {
+    session.status = 'LOCKED';
+    session.locked_at ||= new Date().toISOString();
+  }
+  res.json(session);
 });
+
+app.post('/api/attendance/sessions/:id/lock', (req: Request, res: Response) => {
+  const id = Number(req.params.id);
+  const session = attendanceSessions.find((item) => item.id === id);
+  if (!session) return res.status(404).json({ detail: 'Session not found' });
+  const user = getCurrentUser(req);
+  if (session.attendance_method !== 'QR' || !canManageClassAttendance(session.class_id, user)) {
+    return res.status(403).json({ detail: 'You are not authorized to lock this QR attendance session.' });
+  }
+  session.status = 'LOCKED';
+  session.active = false;
+  session.is_active = false;
+  session.locked_at ||= new Date().toISOString();
+  res.json(session);
+});
+
+const checkInQrAttendanceSession = (
+  req: Request,
+  res: Response,
+  user: UserItem,
+  session: AttendanceSessionItem,
+) => {
+  const status = getQrSessionStatus(session);
+  if (status === 'LOCKED') {
+    return res.status(403).json({ detail: 'Phiên điểm danh đã được khóa. Bạn không thể điểm danh.' });
+  }
+  if (status === 'UPCOMING') {
+    return res.status(403).json({ detail: 'Phiên điểm danh chưa bắt đầu.' });
+  }
+  const existingRecord = attendanceRecords.find(
+    (record) => record.session_id === session.id && record.student_id === user.id
+  );
+  if (existingRecord) {
+    return res.status(409).json({ detail: 'Bạn đã điểm danh phiên này rồi.' });
+  }
+
+  const studentIp = getRequestIp(req);
+  const lecturerIp = normalizeIpAddress(session.lecturer_ip || '');
+  const warning = !studentIp || !lecturerIp || isLoopbackIp(studentIp) || isLoopbackIp(lecturerIp)
+    ? 'Không thể xác minh mạng khi truy cập qua localhost'
+    : studentIp !== lecturerIp
+      ? 'IP sinh viên khác với IP giảng viên'
+      : null;
+  const checkedAt = new Date();
+  const newRecord: AttendanceRecordItem = {
+    id: attendanceRecords.reduce((maxId, record) => Math.max(maxId, record.id), 0) + 1,
+    session_id: session.id,
+    student_id: user.id,
+    student_code: user.student_code || '',
+    student_name: user.full_name,
+    check_in_time: checkedAt.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+    attendance_time: checkedAt.toISOString(),
+    student_ip: studentIp,
+    attendance_method: 'QR',
+    warning,
+    status: 'present',
+    is_anomaly: false,
+    anomaly_flag: false,
+    anomaly_score: 0.02,
+  };
+  attendanceRecords.push(newRecord);
+  syncStudentClassAttendanceGrade(session.class_id, user.id, user.student_code);
+  return res.status(201).json(newRecord);
+};
 
 app.post('/api/attendance/sessions/:id/check-in', (req: Request, res: Response) => {
   const sessionId = Number(req.params.id);
   const user = getCurrentUser(req);
   const body = req.body || {};
   const session = attendanceSessions.find((s) => s.id === sessionId);
+  if (user.role !== 'STUDENT') return res.status(403).json({ detail: 'Student access required.' });
+  if (!session) return res.status(404).json({ detail: 'Attendance session not found.' });
+  if (!isApprovedClassStudent(session.class_id, user)) {
+    return res.status(403).json({ detail: 'You are not enrolled in this class.' });
+  }
+  if (session.attendance_method === 'QR') {
+    return checkInQrAttendanceSession(req, res, user, session);
+  }
+  const now = Date.now();
+  if (!session.is_active || now < Date.parse(session.start_time) || now > Date.parse(session.expires_at)) {
+    return res.status(403).json({ detail: 'Attendance session is not open.' });
+  }
 
   if (session && body.qr_token && session.qr_token && body.qr_token.toUpperCase() !== session.qr_token.toUpperCase()) {
     return res.status(400).json({ detail: 'Invalid check-in code' });
@@ -1105,26 +1356,54 @@ app.post('/api/attendance/sessions/:id/check-in', (req: Request, res: Response) 
   }
 
   const newRecord: AttendanceRecordItem = {
-    id: attendanceRecords.length + 1,
+    id: attendanceRecords.reduce((maxId, record) => Math.max(maxId, record.id), 0) + 1,
     session_id: sessionId,
     student_id: user.id,
     student_code: user.student_code || '',
     student_name: user.full_name,
     check_in_time: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+    attendance_time: new Date().toISOString(),
+    attendance_method: 'MANUAL',
     status: 'present',
     is_anomaly: false,
     anomaly_flag: false,
     anomaly_score: 0.02,
   };
   attendanceRecords.push(newRecord);
-  if (session) {
-    syncStudentClassAttendanceGrade(session.class_id, user.id, user.student_code);
-  }
+  syncStudentClassAttendanceGrade(session.class_id, user.id, user.student_code);
   res.status(201).json(newRecord);
+});
+
+app.post('/api/attendance/sessions/:id/qr-check-in', (req: Request, res: Response) => {
+  const sessionId = Number(req.params.id);
+  const user = getCurrentUser(req);
+  if (user.role !== 'STUDENT') return res.status(403).json({ detail: 'Student access required.' });
+  const session = attendanceSessions.find((item) => item.id === sessionId);
+  if (!session || session.attendance_method !== 'QR') {
+    return res.status(404).json({ detail: 'QR attendance session not found.' });
+  }
+  if (!isApprovedClassStudent(session.class_id, user)) {
+    return res.status(403).json({ detail: 'You are not enrolled in this class.' });
+  }
+  return checkInQrAttendanceSession(req, res, user, session);
 });
 
 app.get('/api/attendance/sessions/:id/records', (req: Request, res: Response) => {
   const sessionId = Number(req.params.id);
+  const session = attendanceSessions.find((item) => item.id === sessionId);
+  if (!session) return res.status(404).json({ detail: 'Attendance session not found.' });
+  const user = getCurrentUser(req);
+  if (user.role === 'STUDENT') {
+    if (!isApprovedClassStudent(session.class_id, user)) {
+      return res.status(403).json({ detail: 'You are not enrolled in this class.' });
+    }
+    return res.json(attendanceRecords.filter(
+      (record) => record.session_id === sessionId && record.student_id === user.id
+    ));
+  }
+  if (!canManageClassAttendance(session.class_id, user)) {
+    return res.status(403).json({ detail: 'You are not authorized to view this attendance roster.' });
+  }
   const records = attendanceRecords.filter((r) => r.session_id === sessionId);
   res.json(records);
 });
@@ -1133,6 +1412,15 @@ app.put('/api/attendance/sessions/:id/records/:studentRef', (req: Request, res: 
   const sessionId = Number(req.params.id);
   const studentRef = req.params.studentRef;
   const status = req.body.status || 'present';
+  const session = attendanceSessions.find((item) => item.id === sessionId);
+  if (!session) return res.status(404).json({ detail: 'Attendance session not found.' });
+  const user = getCurrentUser(req);
+  if (!canManageClassAttendance(session.class_id, user)) {
+    return res.status(403).json({ detail: 'You are not authorized to update this attendance roster.' });
+  }
+  if (!['present', 'late', 'absent', 'excused'].includes(status)) {
+    return res.status(400).json({ detail: 'Invalid attendance status.' });
+  }
 
   let record = attendanceRecords.find(
     (r) => r.session_id === sessionId && (String(r.student_id) === studentRef || r.student_code === studentRef)
@@ -1142,13 +1430,14 @@ app.put('/api/attendance/sessions/:id/records/:studentRef', (req: Request, res: 
     const studentUser = users.find((u) => String(u.id) === studentRef || u.student_code === studentRef);
     if (!studentUser) return res.status(404).json({ detail: 'Student not found' });
     record = {
-      id: attendanceRecords.length + 1,
+      id: attendanceRecords.reduce((maxId, item) => Math.max(maxId, item.id), 0) + 1,
       session_id: sessionId,
       student_id: studentUser.id,
       student_code: studentUser.student_code || studentRef,
       student_name: studentUser.full_name,
       check_in_time: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
       status,
+      attendance_method: 'MANUAL',
       is_anomaly: false,
       anomaly_flag: false,
       anomaly_score: 0,
@@ -1170,6 +1459,10 @@ app.post('/api/attendance/sessions/:id/mark-all-present', (req: Request, res: Re
   const sessionId = Number(req.params.id);
   const session = attendanceSessions.find((s) => s.id === sessionId);
   if (!session) return res.status(404).json({ detail: 'Session not found' });
+  const user = getCurrentUser(req);
+  if (!canManageClassAttendance(session.class_id, user)) {
+    return res.status(403).json({ detail: 'You are not authorized to update this attendance roster.' });
+  }
 
   const classEnrollments = enrollments.filter((e) => e.class_id === session.class_id && e.status === 'APPROVED');
   const nowTime = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
@@ -1178,13 +1471,14 @@ app.post('/api/attendance/sessions/:id/mark-all-present', (req: Request, res: Re
     let rec = attendanceRecords.find((r) => r.session_id === sessionId && (r.student_id === enr.student_id || r.student_code === enr.student_code));
     if (!rec) {
       rec = {
-        id: attendanceRecords.length + 1,
+        id: attendanceRecords.reduce((maxId, item) => Math.max(maxId, item.id), 0) + 1,
         session_id: sessionId,
         student_id: enr.student_id,
         student_code: enr.student_code || String(enr.student_id),
         student_name: enr.student_name || 'Student',
         check_in_time: nowTime,
         status: 'present',
+        attendance_method: 'MANUAL',
         is_anomaly: false,
         anomaly_flag: false,
         anomaly_score: 0,
@@ -1205,6 +1499,10 @@ app.delete('/api/attendance/sessions/:id', (req: Request, res: Response) => {
   const sessionId = Number(req.params.id);
   const session = attendanceSessions.find((s) => s.id === sessionId);
   if (!session) return res.status(404).json({ detail: 'Session not found' });
+  const user = getCurrentUser(req);
+  if (!canManageClassAttendance(session.class_id, user)) {
+    return res.status(403).json({ detail: 'You are not authorized to delete this attendance session.' });
+  }
 
   attendanceSessions = attendanceSessions.filter((s) => s.id !== sessionId);
   attendanceRecords = attendanceRecords.filter((r) => r.session_id !== sessionId);
@@ -1220,8 +1518,15 @@ app.delete('/api/attendance/sessions/:id', (req: Request, res: Response) => {
 
 app.get('/api/classes/:id/attendance', (req: Request, res: Response) => {
   const classId = Number(req.params.id);
+  const user = getCurrentUser(req);
+  if (!canManageClassAttendance(classId, user) && !(user.role === 'STUDENT' && isApprovedClassStudent(classId, user))) {
+    return res.status(403).json({ detail: 'You are not authorized to view this class attendance.' });
+  }
   const classSessionIds = attendanceSessions.filter((s) => s.class_id === classId).map((s) => s.id);
-  const records = attendanceRecords.filter((r) => classSessionIds.includes(r.session_id));
+  const records = attendanceRecords.filter((r) =>
+    classSessionIds.includes(r.session_id) &&
+    (user.role !== 'STUDENT' || r.student_id === user.id)
+  );
   res.json(records);
 });
 

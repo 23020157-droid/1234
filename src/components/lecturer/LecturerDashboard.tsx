@@ -94,6 +94,7 @@ interface LecturerDashboardProps {
     checkInCode: string;
     allowLateMinutes: number;
     startImmediately?: boolean;
+    attendanceMethod?: 'MANUAL' | 'QR';
   }) => void | Promise<void>;
   onStartAttendanceSession?: (sessionId: string) => void | Promise<void>;
   onCloseAttendanceSession?: (sessionId: string) => void | Promise<void>;

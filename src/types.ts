@@ -232,6 +232,7 @@ export interface AttendanceRecord {
   checkInTime?: string;
   method?: 'code' | 'qr' | 'manual' | 'rfid';
   notes?: string;
+  warning?: string | null;
 }
 
 export interface AttendanceSession {
@@ -247,6 +248,9 @@ export interface AttendanceSession {
   endTime: string;
   room: string;
   status: 'scheduled' | 'active' | 'closed';
+  sessionStatus?: 'UPCOMING' | 'ACTIVE' | 'LOCKED';
+  attendanceMethod?: 'MANUAL' | 'QR';
+  sessionCode?: string;
   checkInCode: string;
   allowLateMinutes?: number;
   createdAt: string;

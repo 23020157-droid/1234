@@ -312,6 +312,22 @@ export default function App() {
     if (!startTime || !expiresAt) {
       throw new Error('Attendance session is missing its time range.');
     }
+    const isQrSession = session.attendance_method === 'QR';
+    const startDate = new Date(startTime);
+    const endDate = new Date(expiresAt);
+    const localParts = (date: Date) => {
+      const parts = new Intl.DateTimeFormat('en-GB', {
+        year: 'numeric',
+        month: '2-digit',
+        day: '2-digit',
+        hour: '2-digit',
+        minute: '2-digit',
+        hourCycle: 'h23',
+      }).formatToParts(date);
+      return Object.fromEntries(parts.map((part) => [part.type, part.value]));
+    };
+    const localStart = isQrSession ? localParts(startDate) : null;
+    const localEnd = isQrSession ? localParts(endDate) : null;
     const lateGraceMinutes = Number((session as any).late_minutes ?? (session as any).allow_late_minutes ?? 15);
     const qrToken = String((session as any).qr_token || '').trim();
     const overridePin = latestCreatedSessionPinRef.current &&
@@ -330,22 +346,34 @@ export default function App() {
       lecturerId: String(currentUser?.id || ''),
       lecturerName: currentUser?.full_name || '',
       sessionTitle: (session as any).title || 'Phiên Attendance',
-      date: startTime.slice(0, 10),
-      startTime: startTime.slice(11, 16),
-      endTime: expiresAt.slice(11, 16),
+      date: localStart
+        ? `${localStart.year}-${localStart.month}-${localStart.day}`
+        : startTime.slice(0, 10),
+      startTime: localStart ? `${localStart.hour}:${localStart.minute}` : startTime.slice(11, 16),
+      endTime: localEnd ? `${localEnd.hour}:${localEnd.minute}` : expiresAt.slice(11, 16),
       room: '',
-      status: session.is_active ? 'active' : 'closed',
-      checkInCode: overridePin || 'ATTENDANCEPIN',
+      status: session.status === 'UPCOMING'
+        ? 'scheduled'
+        : session.status === 'LOCKED'
+          ? 'closed'
+          : session.is_active ? 'active' : 'closed',
+      sessionStatus: session.status,
+      attendanceMethod: session.attendance_method || 'MANUAL',
+      sessionCode: session.session_code || undefined,
+      checkInCode: isQrSession ? '' : overridePin || 'ATTENDANCEPIN',
       allowLateMinutes: Number.isFinite(lateGraceMinutes) && lateGraceMinutes > 0 ? lateGraceMinutes : 15,
       createdAt: session.created_at || startTime,
       records: records.map((record) => ({
         id: String(record.id),
         sessionId: String(record.session_id),
-        studentId: String(record.student_code || record.student_id),
+        studentId: String(record.student_id || record.student_code),
         studentName: record.student_name || '',
         studentEmail: '',
         status: normalizeAttendanceStatus(record.status),
         checkInTime: record.check_in_time,
+        method: record.attendance_method === 'QR' ? 'qr' : record.attendance_method === 'MANUAL' ? 'manual' : undefined,
+        warning: record.warning || undefined,
+        notes: record.warning || undefined,
       })),
     };
   };
@@ -1308,6 +1336,7 @@ export default function App() {
     checkInCode: string;
     allowLateMinutes: number;
     startImmediately?: boolean;
+    attendanceMethod?: 'MANUAL' | 'QR';
   }): Promise<void> => {
     setAttendanceLoading(true);
     setAttendanceError(null);
@@ -1317,6 +1346,21 @@ export default function App() {
         throw new Error('Invalid class id for attendance session creation');
       }
       const normalizedPin = String(newSession.checkInCode || '').replace(/[^A-Z0-9]/gi, '').slice(0, 12).toUpperCase();
+      if (newSession.attendanceMethod === 'QR') {
+        const startDate = new Date(`${newSession.date}T${newSession.startTime}:00`);
+        const endDate = new Date(`${newSession.date}T${newSession.endTime}:00`);
+        if (!Number.isFinite(startDate.getTime()) || !Number.isFinite(endDate.getTime()) || endDate <= startDate) {
+          throw new Error('Thời gian bắt đầu và kết thúc không hợp lệ.');
+        }
+        await AttendanceAPI.createQrSession(classIdNumeric, {
+          title: newSession.sessionTitle,
+          start_time: startDate.toISOString(),
+          expires_at: endDate.toISOString(),
+          room: newSession.room,
+        });
+        await refreshAttendanceSessions();
+        return;
+      }
       latestCreatedSessionPinRef.current = {
         courseId: classIdNumeric,
         date: newSession.date,
@@ -1373,7 +1417,12 @@ export default function App() {
     try {
       const id = Number(sessionId);
       if (!Number.isFinite(id) || id <= 0) throw new Error('Invalid attendance session id');
-      await AttendanceAPI.closeSession(id);
+      const session = attendanceSessions.find((item) => String(item.id) === String(sessionId));
+      if (session?.attendanceMethod === 'QR') {
+        await AttendanceAPI.lockSession(id);
+      } else {
+        await AttendanceAPI.closeSession(id);
+      }
       await refreshAttendanceSessions();
     } catch (err: any) {
       setAttendanceError(err?.message || String(err));
@@ -1602,8 +1651,70 @@ export default function App() {
     }
 
     const submittedCode = String(code || '').trim();
-    if (!submittedCode) {
+    if (session.attendanceMethod !== 'QR' && !submittedCode) {
       throw new Error('Mã PIN không đúng hoặc đã hết hạn.');
+    }
+
+    if (session.attendanceMethod === 'QR') {
+      try {
+        const sid = Number(sessionId);
+        const checkedInRecord = await AttendanceAPI.qrCheckIn(sid);
+        const checkedInStudentId = String(checkedInRecord.student_id || checkedInRecord.student_code || getCurrentStudentAttendanceId());
+        setAttendanceSessions((prev) =>
+          prev.map((item) => String(item.id) !== String(sessionId) ? item : {
+            ...item,
+            records: [
+              ...(item.records || []).filter((record) =>
+                String(record.studentId) !== checkedInStudentId &&
+                String(record.studentId) !== getCurrentStudentAttendanceId()
+              ),
+              {
+                id: String(checkedInRecord.id),
+                sessionId: item.id,
+                studentId: checkedInStudentId,
+                studentName: checkedInRecord.student_name || currentUser?.full_name || '',
+                studentEmail: currentUser?.email || '',
+                status: normalizeAttendanceStatus(checkedInRecord.status),
+                checkInTime: checkedInRecord.check_in_time,
+                method: 'qr',
+                warning: checkedInRecord.warning || undefined,
+              },
+            ],
+          })
+        );
+        setAttendanceData((prev) =>
+          prev.map((item) => {
+            const matchesCourse =
+              String(item.courseCode || '').toLowerCase() === String(session.courseCode || '').toLowerCase() ||
+              String(item.courseCode || '').toLowerCase() === String(session.courseId || '').toLowerCase();
+            if (!matchesCourse) return item;
+            const recentSessions = item.recentSessions || [];
+            const hasDate = recentSessions.some((recent: any) => recent.date === session.date);
+            const nextRecentSessions = hasDate
+              ? recentSessions.map((recent: any) =>
+                  recent.date === session.date ? { ...recent, status: 'present' as AttendanceStatus } : recent
+                )
+              : [{ date: session.date, topic: session.sessionTitle, status: 'present' as AttendanceStatus }, ...recentSessions];
+            const attendedSessions = Math.min(item.totalSessions, item.attendedSessions + 1);
+            const absentSessions = Math.max(0, item.absentSessions - 1);
+            const percentage = item.totalSessions > 0
+              ? Number(((attendedSessions / item.totalSessions) * 100).toFixed(1))
+              : 100;
+            return {
+              ...item,
+              attendedSessions,
+              absentSessions,
+              percentage,
+              status: percentage >= item.minRequiredPercentage ? 'good' : 'warning',
+              recentSessions: nextRecentSessions,
+            };
+          })
+        );
+        await refreshStudentGrades();
+        return true;
+      } catch (err: any) {
+        throw new Error(err?.message || String(err));
+      }
     }
 
     const currentStudentId = getCurrentStudentAttendanceId();
@@ -1887,6 +1998,14 @@ export default function App() {
       void refreshAttendanceSessions(courses);
     }
   }, [currentRole, currentUser, courses]);
+
+  useEffect(() => {
+    if ((currentRole !== 'student' && currentRole !== 'lecturer') || courses.length === 0) return;
+    const refreshTimer = window.setInterval(() => {
+      void refreshAttendanceSessions(courses);
+    }, 30_000);
+    return () => window.clearInterval(refreshTimer);
+  }, [currentRole, courses]);
 
   useEffect(() => {
     if (currentRole !== 'student' && currentRole !== 'admin') return;

@@ -3,7 +3,6 @@ import {
   CheckCircle2,
   Clock,
   XCircle,
-  QrCode,
   Calendar,
   AlertCircle,
   Search,
@@ -54,13 +53,14 @@ export const StudentAttendance: React.FC<StudentAttendanceProps> = ({
   const [activeCheckInSession, setActiveCheckInSession] = useState<AttendanceSession | null>(null);
   const [inputCode, setInputCode] = useState('');
   const [checkInError, setCheckInError] = useState('');
+  const [oneTapPendingId, setOneTapPendingId] = useState<string | null>(null);
+  const [oneTapMessage, setOneTapMessage] = useState<Record<string, string>>({});
   const [checkInSuccess, setCheckInSuccess] = useState<{
     status: AttendanceStatus;
     time: string;
     courseCode: string;
   } | null>(null);
   const [isSubmittingCheckIn, setIsSubmittingCheckIn] = useState(false);
-  const [isScanningQR, setIsScanningQR] = useState(false);
 
   // Filters for History Tab
   const [historyStatusFilter, setHistoryStatusFilter] = useState<'all' | AttendanceStatus>('all');
@@ -309,24 +309,20 @@ export const StudentAttendance: React.FC<StudentAttendanceProps> = ({
     }
   };
 
-  // Handle simulated QR Scan
-  const handleSimulateQRScan = async () => {
-    if (!activeCheckInSession) return;
-    setIsScanningQR(true);
-    setCheckInError('');
+  const handleOneTapCheckIn = async (session: AttendanceSession) => {
+    setOneTapPendingId(session.id);
+    setOneTapMessage((previous) => ({ ...previous, [session.id]: '' }));
     try {
-      const ok = onCheckIn ? await onCheckIn(activeCheckInSession.id, activeCheckInSession.checkInCode) : false;
+      const ok = onCheckIn ? await onCheckIn(session.id, '') : false;
       if (!ok) {
-        setCheckInError('QR check-in failed.');
-        return;
+        throw new Error('Không thể điểm danh phiên này.');
       }
-
-      const nowTime = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-      setCheckInSuccess({ status: 'present', time: nowTime, courseCode: activeCheckInSession.courseCode });
-    } catch (err: any) {
-      setCheckInError(err?.message || String(err) || 'QR check-in failed.');
+      setOneTapMessage((previous) => ({ ...previous, [session.id]: 'Điểm danh thành công.' }));
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : String(err);
+      setOneTapMessage((previous) => ({ ...previous, [session.id]: message }));
     } finally {
-      setIsScanningQR(false);
+      setOneTapPendingId(null);
     }
   };
 
@@ -502,19 +498,35 @@ export const StudentAttendance: React.FC<StudentAttendanceProps> = ({
                             <button
                               type="button"
                               onClick={() => {
+                                if (session.attendanceMethod === 'QR') {
+                                  void handleOneTapCheckIn(session);
+                                  return;
+                                }
                                 setActiveCheckInSession(session);
                                 setInputCode('');
                                 setCheckInError('');
                                 setCheckInSuccess(null);
                               }}
+                              disabled={oneTapPendingId === session.id}
                               className="px-3.5 py-1.5 bg-indigo-600 hover:bg-indigo-700 text-white font-bold text-xs rounded-xl shadow-xs transition-colors flex items-center gap-1.5"
                             >
-                              <KeyRound className="w-3.5 h-3.5" />
-                              Điểm danh ngay
+                              {session.attendanceMethod === 'QR'
+                                ? <Check className="w-3.5 h-3.5" />
+                                : <KeyRound className="w-3.5 h-3.5" />}
+                              {oneTapPendingId === session.id
+                                ? 'Đang gửi...'
+                                : session.attendanceMethod === 'QR' ? 'ĐIỂM DANH' : 'Điểm danh ngay'}
                             </button>
                           </div>
                         )}
                       </div>
+                      {oneTapMessage[session.id] && (
+                        <p className={`mt-2 text-xs font-semibold ${
+                          oneTapMessage[session.id] === 'Điểm danh thành công.' ? 'text-emerald-700' : 'text-rose-700'
+                        }`}>
+                          {oneTapMessage[session.id]}
+                        </p>
+                      )}
                     </div>
                   );
                 })}
@@ -1138,19 +1150,6 @@ export const StudentAttendance: React.FC<StudentAttendanceProps> = ({
                 </button>
               </form>
 
-              {/* Method 2: Simulate Smart Classroom QR Scanner */}
-              <div className="pt-3 border-t border-slate-100 text-center">
-                <span className="text-xs text-slate-400 font-medium block mb-2">hoặc quét mã được trình chiếu</span>
-                <button
-                  type="button"
-                  onClick={handleSimulateQRScan}
-                  disabled={isScanningQR}
-                  className="w-full py-2.5 bg-slate-100 hover:bg-slate-200 text-slate-800 text-xs font-bold rounded-xl border border-slate-200 flex items-center justify-center gap-2 transition-colors"
-                >
-                  <QrCode className="w-4 h-4 text-indigo-600" />
-                  {isScanningQR ? 'Simulating Optical QR Scan...' : 'Scan Classroom QR Code'}
-                </button>
-              </div>
             </div>
           )}
         </Modal>
